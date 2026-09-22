@@ -110,6 +110,8 @@ int setting_crosshair_color_p1 = 0xFF0000;
 int setting_crosshair_color_p2 = 0x0080FF;
 
 bool cdimagecache = false;
+/* beetle_saturn_netplay_deterministic, read at load; see InitCommon. */
+bool setting_netplay_deterministic = false;
 
 // shared internal memory support
 bool shared_intmemory = false;
@@ -332,6 +334,11 @@ static void check_variables(bool startup)
 
    if (startup)
    {
+      var.key = "beetle_saturn_netplay_deterministic";
+      var.value = NULL;
+      setting_netplay_deterministic = environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var)
+            && var.value && !strcmp(var.value, "enabled");
+
       var.key = "beetle_saturn_cdimagecache";
       var.value = NULL;
       if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
@@ -449,6 +456,12 @@ static void check_variables(bool startup)
       SS_SCI_SetEnabled(strcmp(var.value, "disabled") != 0);
    else
       SS_SCI_SetEnabled(true);
+
+   /* Not restart-time either; netplay pins it on. See link_sci.c. */
+   var.key = "beetle_saturn_link_frame_edges";
+   var.value = NULL;
+   link_sci_set_frame_edges(environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value
+         && !strcmp(var.value, "enabled"));
 
    var.key = "beetle_saturn_region";
    var.value = NULL;
@@ -1488,7 +1501,9 @@ void retro_run(void)
 
    EmulateSpecStruct *espec = (EmulateSpecStruct*)&spec;
 
+   link_sci_frame_begin();
    Emulate(espec);
+   link_sci_frame_end();
 
 #ifdef NEED_DEINTERLACER
    if (spec.InterlaceOn)

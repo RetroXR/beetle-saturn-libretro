@@ -103,6 +103,20 @@ uint32_t SS_SCI_FastestFrameMaster(unsigned cpu_mask);
 /* The current timestamp of `cpu`, for a driver called from outside it. */
 int32_t SS_SCI_CPUTimestamp(unsigned cpu);
 
+/* Frame edges: every frame is SS_LinkFrameSpan() link ticks long and starts at
+ * SS_LinkFrameBase(); see link_frame_edges in ss.c. */
+void SS_SetLinkFrameEdges(bool on);
+uint64_t SS_LinkFrameSpan(void);
+uint64_t SS_LinkFrameBase(void);
+
+/* The driver's own state, in the savestate's LINK section: a fixed-size blob
+ * the driver packs and unpacks. Load returns false for a blob it did not write
+ * (an all-zero one from a state without the section), and then changes
+ * nothing. Implemented by the libretro side (link_sci.c). */
+#define SS_LINK_STATE_BYTES 16384
+void SS_LinkDriverStateSave(uint8_t *blob);
+bool SS_LinkDriverStateLoad(const uint8_t *blob);
+
 #ifdef __cplusplus
 }
 #endif

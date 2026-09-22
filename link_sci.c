@@ -135,6 +135,31 @@ static uint64_t sl_next_seq;
 
 static uint64_t sl_rate;
 
+/* Frame edges (beetle_saturn_link_frame_edges; netplay pins it on).
+ *
+ * Group rollback stops every cabled console at every frame edge, and snapshots
+ * the bus there, so nothing about a frame may reach past its edge: the port
+ * never asks the bus for more than the frame (a peer stopped at the edge could
+ * never grant it), and it meets the peer at both edges, so everything either
+ * console stamped up to an edge is on the bus before the next frame runs. The
+ * edges themselves line up because every frame spans the same number of link
+ * ticks (SS_LinkFrameSpan). */
+static bool sl_frame_edges;
+static bool sl_in_frame;
+static uint64_t sl_frame_end;
+
+/* How far the bus has let this console run, or ~0 when nothing bounds it. A
+ * byte may land only up to here. The CPU overshoots its rendezvous by an
+ * instruction, or a block under the JIT, and a register read in that overshoot
+ * would otherwise land anything due by the current cycle -- but a byte due past
+ * the grant may not be on the bus yet, and whether it is depends on how far the
+ * other emulation thread has got. Used with frame edges only. */
+static uint64_t sl_granted = ~(uint64_t)0;
+
+/* A load put the driver back verbatim; the reanchor that follows it must not
+ * then throw that away. */
+static bool sl_restored;
+
 static void sl_log(enum retro_log_level level, const char *fmt, const char *arg)
 {
    if (log_cb)
@@ -307,9 +332,18 @@ static void sl_apply(const struct sl_event *ev)
    }
 }
 
+/* What may have landed by `now`: never past the grant, with frame edges. */
+static uint64_t sl_visible(uint64_t now)
+{
+   if (sl_frame_edges && now > sl_granted)
+      return sl_granted;
+   return now;
+}
+
 /* Hand over everything due by `now`, oldest first, ties in arrival order. */
 static void sl_release(uint64_t now)
 {
+   now = sl_visible(now);
    for (;;)
    {
       unsigned i, best = SL_PENDING_MAX;
@@ -374,7 +408,7 @@ static bool sl_drv_sample(unsigned cpu, uint8_t *value, int32_t ts)
    sl_release(now);
 
    h = &sl_peer_hold[cpu];
-   if (!h->armed || h->tick > now)
+   if (!h->armed || h->tick > sl_visible(now))
       return false;
 
    *value = h->value;
@@ -402,6 +436,32 @@ static void sl_drv_sync(int32_t ts)
       return;
    sl_drain();
    sl_release(sl_now(ts));
+}
+
+/* Advance to `request`, and not a tick short of it.
+ *
+ * The bus hands back less than was asked for when a message or a cable change
+ * arrives while this console waits. That only says something happened on
+ * another thread at some moment, and a port that acted on it would take its
+ * next step at a cycle chosen by thread timing, so two runs of the same inputs
+ * -- a rollback and the lockstep run it has to reproduce -- would part. The
+ * early return is taken only to drain the queue (which lands nothing: bytes
+ * land by their tick). */
+static uint64_t sl_advance_to(uint64_t now, uint64_t request)
+{
+   for (;;)
+   {
+      uint32_t wake = RETRO_LINK_WAKE_NONE;
+      uint64_t grant = sl_link->advance(sl_handle, now, sl_safe, request, &wake);
+
+      if (grant == RETRO_LINK_UNBOUNDED || grant >= request || (wake & RETRO_LINK_WAKE_DETACHED))
+      {
+         sl_granted = (grant == RETRO_LINK_UNBOUNDED || (wake & RETRO_LINK_WAKE_DETACHED))
+               ? ~(uint64_t)0 : grant;
+         return grant;
+      }
+      sl_drain();
+   }
 }
 
 static int32_t sl_drv_poll(int32_t ts)
@@ -435,12 +495,18 @@ static int32_t sl_drv_poll(int32_t ts)
    }
 
    now = sl_now(ts);
+   /* Never past the frame's edge, which a peer stopped there cannot grant. */
+   if (sl_frame_edges && sl_in_frame && now + grain > sl_frame_end)
+      grain = sl_frame_end > now ? sl_frame_end - now : 1;
    if (sl_safe < now + grain)
       sl_safe = now + grain;
 
    /* Published before reading: a peer parked on this console's horizon cannot
     * move until told it moved, and it may hold the very byte wanted next. */
-   grant = sl_link->advance(sl_handle, now, sl_safe, now + grain, &wake);
+   if (sl_frame_edges)
+      grant = sl_advance_to(now, now + grain);
+   else
+      grant = sl_link->advance(sl_handle, now, sl_safe, now + grain, &wake);
 
    sl_refresh_peers();
    sl_drain();
@@ -515,6 +581,8 @@ void link_sci_attach(const struct retro_link_interface *link, unsigned port)
    memset(sl_last_span, 0, sizeof(sl_last_span));
    memset(sl_peer_hold, 0, sizeof(sl_peer_hold));
    memset(sl_my_hold, 0, sizeof(sl_my_hold));
+   sl_in_frame = false;
+   sl_granted = ~(uint64_t)0;
 
    SS_SCI_SetDriver(&sl_driver);
    sl_log(RETRO_LOG_WARN, "[link] %s: Communication Connector attached\n", SL_PROTOCOL);
@@ -533,6 +601,8 @@ void link_sci_detach(void)
    sl_link = NULL;
    sl_pending_count = 0;
    sl_peers = 0;
+   sl_in_frame = false;
+   sl_granted = ~(uint64_t)0;
 }
 
 /* A reset or a state load moved the console's clock under the bus. Nothing in
@@ -540,7 +610,180 @@ void link_sci_detach(void)
  * all that is left is to forget what was queued. */
 void link_sci_reanchor(void)
 {
+   if (sl_restored)
+   {
+      sl_restored = false;
+      return;
+   }
    sl_pending_count = 0;
    memset(sl_peer_hold, 0, sizeof(sl_peer_hold));
    memset(sl_my_hold, 0, sizeof(sl_my_hold));
+}
+
+/* ── frame edges ──────────────────────────────────────────────────────────── */
+
+/* A rendezvous at the edge itself: this console promises nothing before the
+ * edge and waits for every peer to reach it, so all either stamped up to here
+ * is on the bus, and drained, before the next frame runs. */
+static void sl_edge(uint64_t edge)
+{
+   if (sl_safe < edge)
+      sl_safe = edge;
+   sl_advance_to(edge, edge);
+   sl_refresh_peers();
+   sl_drain();
+}
+
+void link_sci_set_frame_edges(bool on)
+{
+   if (on == sl_frame_edges)
+      return;
+   sl_frame_edges = on;
+   sl_in_frame = false;
+   sl_granted = ~(uint64_t)0;
+   SS_SetLinkFrameEdges(on);
+}
+
+void link_sci_frame_begin(void)
+{
+   uint64_t edge;
+
+   if (!sl_attached || !sl_frame_edges)
+      return;
+   edge = SS_LinkFrameBase();
+   sl_edge(edge);
+   sl_frame_end = edge + SS_LinkFrameSpan();
+   sl_in_frame = true;
+   sl_release(edge);
+}
+
+void link_sci_frame_end(void)
+{
+   if (!sl_attached || !sl_frame_edges)
+      return;
+   sl_in_frame = false;
+   /* Emulate has already moved the clock on to the next frame's edge. */
+   sl_edge(SS_LinkFrameBase());
+}
+
+/* ── the driver's state, in the savestate's LINK section ──────────────────── */
+
+#define SL_STATE_MAGIC   0x4b4e4c53u /* "SLNK" */
+#define SL_STATE_VERSION 1u
+
+/* Packed by hand, little-endian, every byte written: padding left to chance
+ * would make two identical states hash differently. */
+struct sl_packer
+{
+   uint8_t *p;
+   const uint8_t *q;
+};
+
+static void sl_w8(struct sl_packer *k, uint8_t v) { *k->p++ = v; }
+static void sl_w32(struct sl_packer *k, uint32_t v) { sl_put32(k->p, v); k->p += 4; }
+static void sl_w64(struct sl_packer *k, uint64_t v) { sl_w32(k, (uint32_t)v); sl_w32(k, (uint32_t)(v >> 32)); }
+static uint8_t sl_r8(struct sl_packer *k) { return *k->q++; }
+static uint32_t sl_r32(struct sl_packer *k) { uint32_t v = sl_get32(k->q); k->q += 4; return v; }
+static uint64_t sl_r64(struct sl_packer *k) { uint64_t lo = sl_r32(k); return lo | ((uint64_t)sl_r32(k) << 32); }
+
+/* The fixed part is 117 bytes and each queued event 26. */
+typedef char sl_state_fits[(117 + SL_PENDING_MAX * 26 <= SS_LINK_STATE_BYTES) ? 1 : -1];
+
+static void sl_w_hold(struct sl_packer *k, const struct sl_hold *h)
+{
+   sl_w8(k, h->armed ? 1 : 0);
+   sl_w8(k, h->value);
+   sl_w64(k, h->tick);
+}
+
+static void sl_r_hold(struct sl_packer *k, struct sl_hold *h)
+{
+   h->armed = sl_r8(k) != 0;
+   h->value = sl_r8(k);
+   h->tick = sl_r64(k);
+}
+
+void SS_LinkDriverStateSave(uint8_t *blob)
+{
+   struct sl_packer k;
+   unsigned i;
+
+   k.p = blob;
+   sl_w32(&k, SL_STATE_MAGIC);
+   sl_w32(&k, SL_STATE_VERSION);
+   sl_w32(&k, (uint32_t)sl_self_id);
+   sl_w32(&k, sl_peers);
+   sl_w64(&k, sl_safe);
+   for (i = 0; i < 2; i++)
+   {
+      sl_w64(&k, sl_last_stamp[i]);
+      sl_w32(&k, sl_last_span[i]);
+   }
+   for (i = 0; i < 2; i++)
+      sl_w_hold(&k, &sl_peer_hold[i]);
+   for (i = 0; i < 2; i++)
+      sl_w_hold(&k, &sl_my_hold[i]);
+   sl_w32(&k, sl_pending_count);
+   sl_w64(&k, sl_next_seq);
+   sl_w8(&k, sl_in_frame ? 1 : 0);
+   sl_w64(&k, sl_frame_end);
+   sl_w64(&k, sl_granted);
+   for (i = 0; i < sl_pending_count; i++)
+   {
+      const struct sl_event *ev = &sl_pending[i];
+      sl_w64(&k, ev->tick);
+      sl_w64(&k, ev->seq);
+      sl_w8(&k, ev->type);
+      sl_w8(&k, ev->cpu);
+      sl_w8(&k, ev->value);
+      sl_w8(&k, ev->flags);
+      sl_w8(&k, ev->fmt.sync ? 1 : 0);
+      sl_w8(&k, ev->fmt.frame);
+      sl_w32(&k, ev->fmt.bit_master);
+   }
+}
+
+bool SS_LinkDriverStateLoad(const uint8_t *blob)
+{
+   struct sl_packer k;
+   unsigned i, count;
+
+   k.q = blob;
+   if (sl_r32(&k) != SL_STATE_MAGIC || sl_r32(&k) != SL_STATE_VERSION)
+      return false;
+   sl_self_id = (int)sl_r32(&k);
+   sl_peers = sl_r32(&k);
+   sl_safe = sl_r64(&k);
+   for (i = 0; i < 2; i++)
+   {
+      sl_last_stamp[i] = sl_r64(&k);
+      sl_last_span[i] = sl_r32(&k);
+   }
+   for (i = 0; i < 2; i++)
+      sl_r_hold(&k, &sl_peer_hold[i]);
+   for (i = 0; i < 2; i++)
+      sl_r_hold(&k, &sl_my_hold[i]);
+   count = sl_r32(&k);
+   if (count > SL_PENDING_MAX)
+      count = SL_PENDING_MAX;
+   sl_next_seq = sl_r64(&k);
+   sl_in_frame = sl_r8(&k) != 0;
+   sl_frame_end = sl_r64(&k);
+   sl_granted = sl_r64(&k);
+   for (i = 0; i < count; i++)
+   {
+      struct sl_event *ev = &sl_pending[i];
+      ev->tick = sl_r64(&k);
+      ev->seq = sl_r64(&k);
+      ev->type = sl_r8(&k);
+      ev->cpu = sl_r8(&k);
+      ev->value = sl_r8(&k);
+      ev->flags = sl_r8(&k);
+      ev->fmt.sync = sl_r8(&k) != 0;
+      ev->fmt.frame = sl_r8(&k);
+      ev->fmt.bit_master = sl_r32(&k);
+   }
+   sl_pending_count = count;
+   sl_restored = true;
+   return true;
 }

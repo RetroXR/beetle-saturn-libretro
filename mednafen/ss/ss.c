@@ -78,6 +78,8 @@ extern uint32_t IBufferCount;
 #include "../general.h"		/* MDFN_MidSync (defined in libretro.c) */
 extern bool is_pal;
 extern char retro_base_directory[4096];
+/* beetle_saturn_netplay_deterministic, libretro.c. */
+extern bool setting_netplay_deterministic;
 
 /* MidSync forward decl removed (phase 7c): the canonical extern decl
  * lives in ss_init.h now, and MidSync's definition below is non-static. */
@@ -1534,6 +1536,33 @@ static int32_t                   cur_clock_div;
  * horizontal resolution (cur_clock_div is 61 or 65), master cycles do neither. */
 static uint64_t                  link_frame_base;
 
+/* Frame edges (beetle_saturn_link_frame_edges): every frame spans the same
+ * number of link ticks, SS_LinkFrameSpan(), whatever the video mode made of it.
+ * Netplay rolls a cabled pair back as one group, stopping both consoles at every
+ * frame edge, and that is only one instant on the wire if every console's frame
+ * N ends on the same tick. A Saturn frame does not: an interlaced field is a line
+ * shorter than a progressive one, PAL is longer than NTSC, and the CPU overshoots
+ * the end by an instruction or a block. So the link clock runs 1:1 with the
+ * master clock through a frame and then jumps to the next edge; a frame is never
+ * longer than the span, which is a fortieth of a second. Timing between two
+ * consoles is exact within a frame and only the gap at its end has no length. */
+static bool                      link_frame_edges;
+
+void SS_SetLinkFrameEdges(bool on)
+{
+ link_frame_edges = on;
+}
+
+uint64_t SS_LinkFrameSpan(void)
+{
+ return (uint64_t)(EmulatedSS.MasterClock >> 32) / 40;
+}
+
+uint64_t SS_LinkFrameBase(void)
+{
+ return link_frame_base;
+}
+
 int32_t SS_ClockDiv(void)
 {
  return cur_clock_div ? cur_clock_div : 61;
@@ -1541,9 +1570,14 @@ int32_t SS_ClockDiv(void)
 
 uint64_t SS_LinkClock(int32_t ts)
 {
+ uint64_t off;
+
  if(ts < 0)
   ts = 0;
- return link_frame_base + (uint64_t)ts * (uint64_t)SS_ClockDiv();
+ off = (uint64_t)ts * (uint64_t)SS_ClockDiv();
+ if(link_frame_edges && off >= SS_LinkFrameSpan())
+  off = SS_LinkFrameSpan() - 1;
+ return link_frame_base + off;
 }
 
 uint64_t SS_LinkClockRate(void)
@@ -1623,7 +1657,7 @@ void Emulate(struct EmulateSpecStruct* espec_arg)
 
  ForceEventUpdates(end_ts);
 
- link_frame_base += (uint64_t)end_ts * (uint64_t)SS_ClockDiv();
+ link_frame_base += link_frame_edges ? SS_LinkFrameSpan() : (uint64_t)end_ts * (uint64_t)SS_ClockDiv();
 
  SMPC_EndFrame(espec, end_ts);
 
@@ -2078,13 +2112,36 @@ bool MDFN_COLD InitCommon(const unsigned cpucache_emumode, const unsigned horrib
    SS_LoadBackupRAM();
    SS_LoadCartNV();
 
+   /* beetle_saturn_netplay_deterministic: every peer of a netplay session has
+    * to boot the same machine. The SMPC's clock and its four settings bytes
+    * come from the player's own .smpc file, or from the host's clock with
+    * autortc, so two players' consoles differed before the first frame. Both
+    * are replaced here by a fixed, valid clock (a valid one, or the BIOS
+    * stops to have it set) and factory settings with the configured language.
+    * Built by hand rather than through localtime, which would put peers in
+    * different time zones on different days. The file is left alone. */
+   {
+      if(setting_netplay_deterministic)
+      {
+         struct tm fixed;
+
+         memset(&fixed, 0, sizeof(fixed));
+         fixed.tm_year = 98;   /* Thursday 1 January 1998, 00:00:00 */
+         fixed.tm_mon = 0;
+         fixed.tm_mday = 1;
+         fixed.tm_wday = 4;
+         SMPC_SetRTC(NULL, 0);
+         SMPC_SetRTC(&fixed, MDFN_GetSettingUI("ss.smpc.autortc.lang"));
+      }
+   }
+
    /* Just-loaded state is by definition clean. The cycle-counted
     * SaveDelay variables are gone -- see comment in Emulate(). */
    BackupRAM_Dirty = false;
    CART_GetClearNVDirty();
    CartNV_Dirty = false;
 
-   if(MDFN_GetSettingB("ss.smpc.autortc"))
+   if(MDFN_GetSettingB("ss.smpc.autortc") && !setting_netplay_deterministic)
    {
       time_t ut;
       struct tm* ht;
@@ -2702,6 +2759,29 @@ int LibRetro_StateAction(StateMem* sm, const unsigned load)
 
    SOUND_StateAction(sm, load, false);
    CART_StateAction(sm, load, false);
+
+   /* The link cable: its clock and the driver's queue, horizon and grant. A
+    * group rollback restores the bus to the same frame edge, so with frame
+    * edges on a load puts these back verbatim; otherwise the clock keeps
+    * running forward, as it always has, and the driver forgets what was in
+    * flight (link_sci_reanchor). Optional: older states have no LINK. */
+   {
+      static uint8_t link_blob[SS_LINK_STATE_BYTES];
+      uint64_t link_base = link_frame_base;
+      SFORMAT LinkRegs[] =
+      {
+         SFVARN(link_base, "base"),
+         SFPTR8N(link_blob, SS_LINK_STATE_BYTES, "driver"),
+         SFEND
+      };
+
+      memset(link_blob, 0, sizeof(link_blob));
+      if(!load)
+         SS_LinkDriverStateSave(link_blob);
+      MDFNSS_StateAction(sm, load, false, LinkRegs, "LINK", true);
+      if(load && link_frame_edges && SS_LinkDriverStateLoad(link_blob))
+         link_frame_base = link_base;
+   }
 
    if(load)
       memcpy(BackupRAM_StateHelper, BackupRAM, sizeof(BackupRAM));

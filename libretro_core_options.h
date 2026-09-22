@@ -837,6 +837,34 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "enabled"
    },
    {
+      "beetle_saturn_link_frame_edges",
+      "Link Cable Frame Edges",
+      NULL,
+      "Give every frame the same length on the link cable and meet the other console at both ends of it, so two cabled consoles can be stopped, saved and restored together at a frame boundary. Netplay turns this on to roll a cabled pair back as one; there is no reason to change it by hand.",
+      NULL,
+      NULL,
+      {
+         { "disabled", NULL },
+         { "enabled",  NULL },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+   {
+      "beetle_saturn_netplay_deterministic",
+      "Deterministic Boot (Netplay)",
+      NULL,
+      "Boot with a fixed clock (1 January 1998) and factory system settings instead of the host's clock or the saved ones, so every player in a netplay session starts the same console. Netplay turns this on; there is no reason to change it by hand. Restart required.",
+      NULL,
+      NULL,
+      {
+         { "disabled", NULL },
+         { "enabled",  NULL },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+   {
       "beetle_saturn_save_method",
       "Save Method",
       NULL,
