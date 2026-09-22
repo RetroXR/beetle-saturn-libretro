@@ -549,10 +549,14 @@ void SH7095_AdjustTS(SH7095* z, int32_t delta)
 
  z->timestamp += delta;
  z->FRT.lastts += delta;
- z->SCI.tx_end += delta;
- z->SCI.poll_ts += delta;
 
 #define ATSD(v) v = ((sscpu_timestamp_t)(-1000000) > (sscpu_timestamp_t)(v + (delta)) ? (sscpu_timestamp_t)(-1000000) : (sscpu_timestamp_t)(v + (delta)))
+ /* Floored like the others: an idle port's tx_end otherwise sinks a frame's
+  * cycles every frame, until it wraps, and a state load clamps it -- so a run
+  * that loaded a state and one that did not held different values, and the
+  * whole-state hash told them apart. */
+ ATSD(z->SCI.tx_end);
+ ATSD(z->SCI.poll_ts);
  ATSD(z->DMA_Timestamp);
  ATSD(z->DMA_SGEndTimestamp);
 
@@ -5535,6 +5539,7 @@ void SH7095_StateAction(SH7095* z, StateMem* sm, const unsigned load, const bool
   SFVARN(z->SCI.TSR, "SCI.TSR"),
   SFVARN(z->SCI.tx_state, "SCI.tx_state"),
   SFVARN(z->SCI.tx_end, "SCI.tx_end"),
+  SFVARN(z->SCI.poll_ts, "SCI.poll_ts"),
 
   SFVARN(z->ExtHalt,    "ExtHalt"),
   SFVARN(z->ExtHaltDMA, "ExtHaltDMA"),
@@ -5714,7 +5719,9 @@ void SH7095_PostStateLoad(SH7095* z, const unsigned state_version, const bool re
   z->timestamp = (z->timestamp < -1000000) ? -1000000 : (z->timestamp > 1000000) ? 1000000 : z->timestamp;
   z->FRT.lastts = (z->FRT.lastts < -1000000) ? -1000000 : (z->FRT.lastts > 1000000) ? 1000000 : z->FRT.lastts;
   z->SCI.tx_end = (z->SCI.tx_end < -1000000) ? -1000000 : (z->SCI.tx_end > 1000000) ? 1000000 : z->SCI.tx_end;
-  z->SCI.poll_ts = z->timestamp;
+  /* Saved, not reset: when the link driver next meets the bus is part of the
+   * machine, and a load that moved it moved FRT_WDT_NextTS with it. */
+  z->SCI.poll_ts = (z->SCI.poll_ts < -1000000) ? -1000000 : (z->SCI.poll_ts > 1000000) ? 1000000 : z->SCI.poll_ts;
   if(z->SCI.tx_state > SH7095_SCI_TX_CLOCKING_RX) z->SCI.tx_state = SH7095_SCI_TX_IDLE;
   z->DMA_Timestamp = (z->DMA_Timestamp < -1000000) ? -1000000 : (z->DMA_Timestamp > 1000000) ? 1000000 : z->DMA_Timestamp;
   z->DMA_SGEndTimestamp = (z->DMA_SGEndTimestamp < -1000000) ? -1000000 : (z->DMA_SGEndTimestamp > 1000000) ? 1000000 : z->DMA_SGEndTimestamp;
