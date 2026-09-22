@@ -1529,6 +1529,28 @@ static struct EmulateSpecStruct* espec;
 static bool                      AllowMidSync;
 static int32_t                   cur_clock_div;
 
+/* Master-clock cycles in every frame already emulated. The link cable's
+ * clock: CPU timestamps restart each frame and their unit changes with the
+ * horizontal resolution (cur_clock_div is 61 or 65), master cycles do neither. */
+static uint64_t                  link_frame_base;
+
+int32_t SS_ClockDiv(void)
+{
+ return cur_clock_div ? cur_clock_div : 61;
+}
+
+uint64_t SS_LinkClock(int32_t ts)
+{
+ if(ts < 0)
+  ts = 0;
+ return link_frame_base + (uint64_t)ts * (uint64_t)SS_ClockDiv();
+}
+
+uint64_t SS_LinkClockRate(void)
+{
+ return (uint64_t)(EmulatedSS.MasterClock >> 32);
+}
+
 static INLINE void UpdateSMPCInput(const sscpu_timestamp_t timestamp)
 {
  int32_t elapsed_time;
@@ -1600,6 +1622,8 @@ void Emulate(struct EmulateSpecStruct* espec_arg)
  assert(end_ts >= 0);
 
  ForceEventUpdates(end_ts);
+
+ link_frame_base += (uint64_t)end_ts * (uint64_t)SS_ClockDiv();
 
  SMPC_EndFrame(espec, end_ts);
 

@@ -96,6 +96,15 @@
 static void SH7095_RecalcMRWFP_0(SH7095* z);
 static void SH7095_RecalcMRWFP_1_7(SH7095* z);
 static void SH7095_DMA_RecalcRunning(SH7095* z);
+#include "../git.h"
+/* SS_SCI_TRACE=1 in the environment logs SCI register traffic at WARN, with
+ * repeats of the same access from the same PC folded -- a game polling SSR
+ * would otherwise be the whole log. For finding out what a link game does. */
+#include <stdlib.h>
+static int scitrace_on = -1;
+static unsigned scitrace_n[2];
+static uint32_t scitrace_ring[2][8];
+#define SCITRACE(kind,A,V) do { if(((A)&0xFF) < 0x06) { if(scitrace_on < 0) scitrace_on = getenv("SS_SCI_TRACE") ? atoi(getenv("SS_SCI_TRACE")) : 0; if(scitrace_on && !(scitrace_on >= 2 && z == &CPU[0])) { unsigned c_ = (z == &CPU[0]) ? 0 : 1; uint32_t k_ = ((uint32_t)z->PC << 8) ^ ((A)&0xFF) ^ ((uint32_t)((V)&0xFF) << 4) ^ ((uint32_t)(kind)[0] << 24); bool seen_ = false; if(scitrace_on != 3) for(unsigned q_ = 0; q_ < 8; q_++) seen_ |= (scitrace_ring[c_][q_] == k_); if(!seen_ && scitrace_n[c_] < 4000) { scitrace_ring[c_][scitrace_n[c_] & 7] = k_; scitrace_n[c_]++; if(log_cb) log_cb(RETRO_LOG_WARN, "[scitrace] %04X cpu%u %s %02X=%02X pc=%08X ts=%d ssr=%02X\n", (unsigned)((uintptr_t)CPU >> 4) & 0xFFFF, c_, kind, (unsigned)((A)&0xFF), (unsigned)((V)&0xFF), (unsigned)z->PC, (int)z->timestamp, (unsigned)z->SCI.SSR); } } } } while(0)
 static void SH7095_FRT_WDT_Recalc_NET(SH7095* z);
 static void SH7095_FRT_WDT_Update(SH7095* z);
 static void SH7095_INTC_Reset(SH7095* z);
@@ -120,6 +129,8 @@ static void SH7095_OnChipRegWrite_u32(SH7095* z, uint32_t A, uint32_t V);
 static uint8_t  SH7095_Cache_ReadDataArray_u8 (SH7095* z, uint32_t A);
 static uint16_t SH7095_Cache_ReadDataArray_u16(SH7095* z, uint32_t A);
 static uint32_t SH7095_Cache_ReadDataArray_u32(SH7095* z, uint32_t A);
+
+#include "sh7095_sci.inc"
 static uint32_t SH7095_Cache_ReadAddressArray (SH7095* z, uint32_t A);
 static void SH7095_DIVU_S32_S32(SH7095* z);
 static void SH7095_DIVU_S64_S32(SH7095* z);
@@ -538,6 +549,8 @@ void SH7095_AdjustTS(SH7095* z, int32_t delta)
 
  z->timestamp += delta;
  z->FRT.lastts += delta;
+ z->SCI.tx_end += delta;
+ z->SCI.poll_ts += delta;
 
 #define ATSD(v) v = ((sscpu_timestamp_t)(-1000000) > (sscpu_timestamp_t)(v + (delta)) ? (sscpu_timestamp_t)(-1000000) : (sscpu_timestamp_t)(v + (delta)))
  ATSD(z->DMA_Timestamp);
@@ -563,7 +576,8 @@ void SH7095_AdjustTS(SH7095* z, int32_t delta)
 // de=1, dme=1, te=0, nmif=0, ae=0
 static INLINE bool SH7095_DMA_RunCond(SH7095* z, unsigned ch)
 {
- return ((z->DMAOR & 0x07) == 0x01) && ((z->DMACH[ch].CHCR & 0x03) == 0x01);
+ // ...and, for a channel the SCI paces (DRCR RXI/TXI), a request asserted.
+ return ((z->DMAOR & 0x07) == 0x01) && ((z->DMACH[ch].CHCR & 0x03) == 0x01) && SH7095_SCI_DMARequest(z, ch);
 }
 
 static bool SH7095_DMA_InBurst(SH7095* z)
@@ -611,8 +625,17 @@ static INLINE void SH7095_DMA_DoTransfer(SH7095* z, unsigned ch)
 	{
 	 uint8_t buffer;
 
-	 buffer = SH7095_BSC_BusRead_u8(z, sar & 0x07FFFFFF, false, &z->DMA_Timestamp);
-	 SH7095_BSC_BusWrite_u8(z, dar & 0x07FFFFFF, buffer, false, &z->DMA_Timestamp);
+	 // FFFFFE00-05 is the SCI, which a channel it paces reads (RDR) or writes
+	 // (TDR). Masked to the external bus it would miss the port entirely.
+	 if(sci_enabled && (sar & 0xFFFFFFF8) == 0xFFFFFE00 && (sar & 7) < 6)
+	  buffer = SH7095_SCI_DMARead(z, sar & 7);
+	 else
+	  buffer = SH7095_BSC_BusRead_u8(z, sar & 0x07FFFFFF, false, &z->DMA_Timestamp);
+
+	 if(sci_enabled && (dar & 0xFFFFFFF8) == 0xFFFFFE00 && (dar & 7) < 6)
+	  SH7095_SCI_DMAWrite(z, dar & 7, buffer);
+	 else
+	  SH7095_BSC_BusWrite_u8(z, dar & 0x07FFFFFF, buffer, false, &z->DMA_Timestamp);
 
 	 sar += ainc[0][sm];
  	 dar += ainc[0][dm];
@@ -912,6 +935,8 @@ static void SH7095_FRT_WDT_Recalc_NET(SH7095* z)
   if((wdt_rt) < rt) rt = (wdt_rt);
  }
 
+ rt = SH7095_SCI_NextRT(z, rt);
+
  assert(rt > 0);
 
  z->FRT_WDT_NextTS = z->timestamp + rt;
@@ -924,6 +949,8 @@ static void SH7095_FRT_WDT_Update(SH7095* z)
  uint32_t clocks = z->timestamp - z->FRT.lastts;
 
  z->FRT.lastts = z->timestamp;
+
+ SH7095_SCI_Update(z);
 
  //
  //
@@ -1174,6 +1201,9 @@ static void SH7095_SCI_Reset(SH7095* z)
  //
  z->SCI.RSR = 0x00;
  z->SCI.TSR = 0x00;
+ z->SCI.tx_state = SH7095_SCI_TX_IDLE;
+ z->SCI.tx_end = z->timestamp;
+ z->SCI.poll_ts = z->timestamp;
 
  SH7095_RecalcPendingIntPEX(z);
 }
@@ -1329,9 +1359,18 @@ static NO_INLINE MDFN_HOT void SH7095_OnChipRegWrite_u8(SH7095* z, uint32_t A, u
   shift = ((A & 1) ^ 1) << 3;
   mask = 0xFF << shift;
 
+  SCITRACE("w8",A,V);
   switch(A & 0xFF)
   {
    default:
+	break;
+
+   //
+   // SCI: SMR, BRR, SCR, TDR, SSR, RDR
+   //
+   case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05:
+	if(sci_enabled)
+	 SH7095_SCI_WriteReg(z, A & 0xFF, V);
 	break;
 
    //
@@ -1408,6 +1447,8 @@ static NO_INLINE MDFN_HOT void SH7095_OnChipRegWrite_u8(SH7095* z, uint32_t A, u
    case 0x71:
    case 0x72:
 	z->DMACH[(A & 1) ^ 1].DRCR = V & 0x3;
+	if(scitrace_on > 0 && log_cb)
+	 log_cb(RETRO_LOG_WARN, "[scidma] %04X cpu%u DRCR%u=%02X pc=%08X\n", (unsigned)((uintptr_t)CPU >> 4) & 0xFFFF, (z == &CPU[0]) ? 0u : 1u, (unsigned)((A & 1) ^ 1), (unsigned)V, (unsigned)z->PC);
 	break;
 
    //
@@ -1640,6 +1681,7 @@ static NO_INLINE MDFN_HOT void SH7095_OnChipRegWrite_u16(SH7095* z, uint32_t A, 
   unsigned mask = 0xFFFF;
   unsigned shift = 0;
 
+  SCITRACE("w16",A,V);
   switch(A & 0xFF)
   {
    default:
@@ -1719,6 +1761,8 @@ static NO_INLINE MDFN_HOT void SH7095_OnChipRegWrite_u16(SH7095* z, uint32_t A, 
    case 0x71:
    case 0x72:
 	z->DMACH[(A & 1) ^ 1].DRCR = V & 0x3;
+	if(scitrace_on > 0 && log_cb)
+	 log_cb(RETRO_LOG_WARN, "[scidma] %04X cpu%u DRCR%u=%02X pc=%08X\n", (unsigned)((uintptr_t)CPU >> 4) & 0xFFFF, (z == &CPU[0]) ? 0u : 1u, (unsigned)((A & 1) ^ 1), (unsigned)V, (unsigned)z->PC);
 	break;
 
    //
@@ -2092,6 +2136,8 @@ static NO_INLINE MDFN_HOT void SH7095_OnChipRegWrite_u32(SH7095* z, uint32_t A, 
    case 0x71:
    case 0x72:
 	z->DMACH[(A & 1) ^ 1].DRCR = V & 0x3;
+	if(scitrace_on > 0 && log_cb)
+	 log_cb(RETRO_LOG_WARN, "[scidma] %04X cpu%u DRCR%u=%02X pc=%08X\n", (unsigned)((uintptr_t)CPU >> 4) & 0xFFFF, (z == &CPU[0]) ? 0u : 1u, (unsigned)((A & 1) ^ 1), (unsigned)V, (unsigned)z->PC);
 	break;
 
    //
@@ -2377,6 +2423,11 @@ static INLINE uint8_t SH7095_OnChipRegRead_INLINE_u8(SH7095* z, uint32_t A)
   switch(Am)
   {
    default:
+	break;
+
+   case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05:
+	if(sci_enabled)
+	 ret = SH7095_SCI_ReadReg(z, Am);
 	break;
 
    //
@@ -2730,6 +2781,7 @@ static INLINE uint16_t SH7095_OnChipRegRead_INLINE_u16(SH7095* z, uint32_t A)
   else
    z->MA_until += 1;
 
+  SCITRACE("r16",A,0);
   switch(Am)
   {
    default:
@@ -4546,6 +4598,23 @@ static INLINE uint8_t SH7095_GetPendingInt(SH7095* z, uint8_t* vecnum_out)
  //
  //
  //
+ {
+  unsigned sci_vec;
+
+  if(SH7095_SCI_PendingInt(z, &sci_vec))
+  {
+   if((tmp_ipr = ((z->IPRB >> 12) & 0xF)) > ipr)
+   {
+    ipr = tmp_ipr;
+    vecnum = sci_vec;
+   }
+   if(scitrace_on > 0 && log_cb)
+    log_cb(RETRO_LOG_WARN, "[sciint] %04X cpu%u vec=%02X ipr=%u sr_imask=%u iprb=%04X vcra=%04X vcrb=%04X taking=%d ssr=%02X scr=%02X\n",
+     (unsigned)((uintptr_t)CPU >> 4) & 0xFFFF, SH7095_SCI_Index(z), sci_vec, (unsigned)((z->IPRB >> 12) & 0xF), (unsigned)((z->SR >> 4) & 0xF),
+     z->IPRB, z->VCRA, z->VCRB, vecnum_out != NULL, z->SCI.SSR, z->SCI.SCR);
+  }
+ }
+
  const uint32_t frt_ip_tmp = (z->FRT.FTCSR & z->FRT.TIER & 0x8E);
  if(frt_ip_tmp && (tmp_ipr = ((z->IPRB >> 8) & 0xF)) > ipr)
  {
@@ -5464,6 +5533,8 @@ void SH7095_StateAction(SH7095* z, StateMem* sm, const unsigned load, const bool
 
   SFVARN(z->SCI.RSR, "SCI.RSR"),
   SFVARN(z->SCI.TSR, "SCI.TSR"),
+  SFVARN(z->SCI.tx_state, "SCI.tx_state"),
+  SFVARN(z->SCI.tx_end, "SCI.tx_end"),
 
   SFVARN(z->ExtHalt,    "ExtHalt"),
   SFVARN(z->ExtHaltDMA, "ExtHaltDMA"),
@@ -5642,6 +5713,9 @@ void SH7095_PostStateLoad(SH7095* z, const unsigned state_version, const bool re
    * below cannot dangle. */
   z->timestamp = (z->timestamp < -1000000) ? -1000000 : (z->timestamp > 1000000) ? 1000000 : z->timestamp;
   z->FRT.lastts = (z->FRT.lastts < -1000000) ? -1000000 : (z->FRT.lastts > 1000000) ? 1000000 : z->FRT.lastts;
+  z->SCI.tx_end = (z->SCI.tx_end < -1000000) ? -1000000 : (z->SCI.tx_end > 1000000) ? 1000000 : z->SCI.tx_end;
+  z->SCI.poll_ts = z->timestamp;
+  if(z->SCI.tx_state > SH7095_SCI_TX_CLOCKING_RX) z->SCI.tx_state = SH7095_SCI_TX_IDLE;
   z->DMA_Timestamp = (z->DMA_Timestamp < -1000000) ? -1000000 : (z->DMA_Timestamp > 1000000) ? 1000000 : z->DMA_Timestamp;
   z->DMA_SGEndTimestamp = (z->DMA_SGEndTimestamp < -1000000) ? -1000000 : (z->DMA_SGEndTimestamp > 1000000) ? 1000000 : z->DMA_SGEndTimestamp;
 

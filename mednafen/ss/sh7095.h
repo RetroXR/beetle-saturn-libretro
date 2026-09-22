@@ -349,6 +349,11 @@ struct SH7095
 
   uint8_t RSR;	// Receive shift register
   uint8_t TSR;	// Transmit shift register
+
+  // Everything below is sh7095_sci.inc's; stock Mednafen had only the registers.
+  uint8_t tx_state;	// SH7095_SCI_TX_*
+  sscpu_timestamp_t tx_end;	// when the frame in TSR finishes, while shifting
+  sscpu_timestamp_t poll_ts;	// master only: the link driver's next rendezvous
  } SCI;
  //
  //
