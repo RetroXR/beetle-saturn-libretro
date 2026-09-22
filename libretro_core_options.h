@@ -823,6 +823,20 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "disabled"
    },
    {
+      "beetle_saturn_link_cable",
+      "Link Cable",
+      NULL,
+      "Emulate the SH-2 serial ports behind the Communication Connector, so a frontend that hosts a link bus can join two Saturns with a Link Cable. 'Disabled' is the stock core, whose serial ports do not exist.",
+      NULL,
+      NULL,
+      {
+         { "enabled",  NULL },
+         { "disabled", NULL },
+         { NULL, NULL },
+      },
+      "enabled"
+   },
+   {
       "beetle_saturn_save_method",
       "Save Method",
       NULL,

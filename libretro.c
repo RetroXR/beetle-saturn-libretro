@@ -52,6 +52,8 @@
 #include "mednafen/ss/sh7095_jit.h"
 #include "input.h"
 #include "disc.h"
+#include "link_sci.h"
+#include "mednafen/ss/sci_link.h"
 
 #define MEDNAFEN_CORE_NAME                   "Beetle Saturn"
 #define MEDNAFEN_CORE_VERSION                "v1.32.1"
@@ -316,6 +318,7 @@ void retro_init(void)
 void retro_reset(void)
 {
    SS_Reset(true);
+   link_sci_reanchor();
 }
 
 bool retro_load_game_special(unsigned type, const struct retro_game_info *info, size_t num)
@@ -437,6 +440,15 @@ static void check_variables(bool startup)
             use_mednafen_save_method = true;
       }
    }
+
+   /* Not restart-time. Off is stock Mednafen's SCI: registers read zero and
+    * writes vanish, which is what every session before the cable saw. */
+   var.key = "beetle_saturn_link_cable";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      SS_SCI_SetEnabled(strcmp(var.value, "disabled") != 0);
+   else
+      SS_SCI_SetEnabled(true);
 
    var.key = "beetle_saturn_region";
    var.value = NULL;
@@ -1307,6 +1319,17 @@ bool retro_load_game(const struct retro_game_info *info)
    if (MDFNI_LoadGame(retro_cd_path) == false)
       return false;
 
+   /* The Link Cable. Attached whether or not anything is ever cabled: an
+    * unjoined port bounds nobody, so the core has one code path and still
+    * runs alone. The experimental number first, then the one upstream may
+    * settle on. */
+   {
+      static struct retro_link_interface link;
+      if (environ_cb(RETRO_ENVIRONMENT_GET_LINK_INTERFACE, &link) ||
+          environ_cb(RETRO_ENVIRONMENT_GET_LINK_INTERFACE_FINAL, &link))
+         link_sci_attach(&link, 0);
+   }
+
    // MDFN_LoadGameCheats() was called here previously, but MDFNI_LoadGame
    // already invokes it at the end of its success path. The duplicate
    // call was redundant (and potentially harmful if it ever becomes
@@ -1369,6 +1392,8 @@ void retro_unload_game(void)
          (unsigned long long)SH2JIT_NativeCount, (unsigned long long)SH2JIT_ChainCount, (unsigned long long)SH2JIT_FallbackCount,
          100.0 * SH2JIT_NativeCount / (double)(SH2JIT_NativeCount + SH2JIT_FallbackCount + 1),
          SH2JIT_NativeCount / (double)(SH2JIT_ChainCount + 1));
+   link_sci_detach();
+
    if(!MDFNGameInfo)
       return;
 
@@ -1874,7 +1899,10 @@ bool retro_unserialize(const void *data, size_t size)
    st.malloced       = 0;
    st.initial_malloc = 0;
 
-   return MDFNSS_LoadSM(&st, MEDNAFEN_CORE_VERSION_NUMERIC);
+   if (!MDFNSS_LoadSM(&st, MEDNAFEN_CORE_VERSION_NUMERIC))
+      return false;
+   link_sci_reanchor();
+   return true;
 }
 
 void *retro_get_memory_data(unsigned type)
