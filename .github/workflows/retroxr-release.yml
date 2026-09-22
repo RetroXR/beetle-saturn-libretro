@@ -1,5 +1,5 @@
-# Build the retroXR Beetle Saturn core for Windows and Android and publish it as
-# a release, so retroXR's CoreDownloadManager can fetch it.
+# Build the retroXR Beetle Saturn core for Windows, Android, Linux and macOS and
+# publish it as a release, so retroXR's CoreDownloadManager can fetch it.
 #
 # This fork carries the Sega Saturn Link Cable. Stock Mednafen never emulated
 # the SH-2's serial port at all -- its six registers read zero and every write
@@ -13,6 +13,10 @@
 #
 #   Windows  mednafen_saturn_libretro.dll.zip          containing mednafen_saturn_libretro.dll
 #   Android  mednafen_saturn_libretro_android.so.zip   containing mednafen_saturn_libretro_android.so
+#   Linux    mednafen_saturn_libretro.so.zip           containing mednafen_saturn_libretro.so
+#   macOS    mednafen_saturn_libretro_arm64.dylib.zip
+#            mednafen_saturn_libretro_x86_64.dylib.zip
+#              each containing mednafen_saturn_libretro.dylib
 #
 # Windows is cross-compiled from Ubuntu with mingw-w64; platform=win is passed
 # explicitly because the Makefile otherwise picks a unix target from uname.
@@ -122,9 +126,101 @@ jobs:
           path: mednafen_saturn_libretro_android.so.zip
           if-no-files-found: error
 
+  # The oldest Ubuntu runner: a shared library loads only against a glibc at
+  # least as new as the one it was linked with.
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make zip
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Build
+        run: make platform=unix -j$(nproc)
+
+      - name: Package
+        run: |
+          mapfile -t hits < <(find . -maxdepth 1 -name 'mednafen_saturn_libretro.so' -type f)
+          if [ "${#hits[@]}" -ne 1 ]; then
+            echo "expected exactly one mednafen_saturn_libretro.so, found ${#hits[@]}"
+            exit 1
+          fi
+          mkdir -p stage
+          cp "${hits[0]}" stage/mednafen_saturn_libretro.so
+          (cd stage && zip -q -X ../mednafen_saturn_libretro.so.zip mednafen_saturn_libretro.so)
+          file stage/mednafen_saturn_libretro.so
+          ls -lh mednafen_saturn_libretro.so.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: mednafen_saturn_libretro.so.zip
+          if-no-files-found: error
+
+  # Both architectures on one Apple Silicon runner, with the flags libretro's
+  # own osx-arm64 CI template passes: the osx branch of the Makefile only
+  # applies a target triple and SDK when CROSS_COMPILE=1, and without them the
+  # x86_64 leg would quietly build a second arm64 core. lipo is what catches it.
+  # CC=clang also matters to the LTO block, which picks its spelling by asking
+  # $(CC) whether it is clang.
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: macos-14
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            triple: arm64-apple-macos10.15
+          - arch: x86_64
+            triple: x86_64-apple-macos10.13
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Build
+        run: |
+          make platform=osx CC=clang CXX=clang++ CROSS_COMPILE=1 \
+            LIBRETRO_APPLE_PLATFORM=${{ matrix.triple }} \
+            LIBRETRO_APPLE_ISYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            -j$(sysctl -n hw.ncpu)
+
+      - name: Package
+        run: |
+          lib=mednafen_saturn_libretro.dylib
+          hits=()
+          while IFS= read -r f; do hits+=("$f"); done < <(find . -maxdepth 1 -name "$lib" -type f)
+          if [ "${#hits[@]}" -ne 1 ]; then
+            echo "expected exactly one $lib, found ${#hits[@]}"
+            exit 1
+          fi
+          lipo -info "${hits[0]}"
+          if [ "$(lipo -archs "${hits[0]}")" != "${{ matrix.arch }}" ]; then
+            echo "$lib is not ${{ matrix.arch }}"
+            exit 1
+          fi
+          mkdir -p stage
+          cp "${hits[0]}" "stage/$lib"
+          (cd stage && zip -q -X ../mednafen_saturn_libretro_${{ matrix.arch }}.dylib.zip "$lib")
+          ls -lh mednafen_saturn_libretro_${{ matrix.arch }}.dylib.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: mednafen_saturn_libretro_${{ matrix.arch }}.dylib.zip
+          if-no-files-found: error
+
   publish:
     name: Publish release
-    needs: [windows, android]
+    needs: [windows, android, linux, macos]
     if: github.event_name == 'push' || github.event.inputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
@@ -144,8 +240,8 @@ jobs:
           cat > notes.md <<EOF
           Beetle Saturn (mednafen_saturn) libretro core built for retroXR, from \`$GITHUB_SHA\`.
 
-          Windows x86_64 and Android arm64-v8a. The source for these binaries is
-          this tag.
+          Windows x86_64, Android arm64-v8a, Linux x86_64 and macOS arm64 and
+          x86_64. The source for these binaries is this tag.
 
           Over the stock buildbot build this emulates the SH-2 serial port (SCI)
           behind the Communication Connector -- which had never been emulated --
@@ -163,4 +259,7 @@ jobs:
           gh release upload "$TAG" \
             dist/mednafen_saturn_libretro.dll.zip \
             dist/mednafen_saturn_libretro_android.so.zip \
+            dist/mednafen_saturn_libretro.so.zip \
+            dist/mednafen_saturn_libretro_arm64.dylib.zip \
+            dist/mednafen_saturn_libretro_x86_64.dylib.zip \
             --repo "$GITHUB_REPOSITORY" --clobber
