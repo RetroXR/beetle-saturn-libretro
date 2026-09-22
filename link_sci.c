@@ -495,6 +495,13 @@ static int32_t sl_drv_poll(int32_t ts)
    }
 
    now = sl_now(ts);
+   /* Outside a frame -- the kick when the port attaches, inside
+    * retro_load_game -- there is nothing to meet the bus for: the frame's own
+    * edge does that. Waiting here would wait on a console that is not running
+    * yet, and a netplay session starts nothing until every console has
+    * loaded. */
+   if (sl_frame_edges && !sl_in_frame)
+      return (int32_t)((grain + (uint64_t)div - 1) / (uint64_t)div);
    /* Never past the frame's edge, which a peer stopped there cannot grant. */
    if (sl_frame_edges && sl_in_frame && now + grain > sl_frame_end)
       grain = sl_frame_end > now ? sl_frame_end - now : 1;
