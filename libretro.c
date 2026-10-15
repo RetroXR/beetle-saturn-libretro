@@ -141,6 +141,7 @@ char retro_cd_base_name[4096];
 #endif
 
 static bool libretro_supports_bitmasks = false;
+static bool libretro_can_dupe          = false;
 
 MDFNGI *MDFNGameInfo = NULL;
 
@@ -313,6 +314,12 @@ void retro_init(void)
     * non-trivial (netplay, replay-recording, runahead). */
    if (environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL))
       libretro_supports_bitmasks = true;
+
+   {
+      bool can_dupe = false;
+      if (environ_cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &can_dupe))
+         libretro_can_dupe = can_dupe;
+   }
 
    check_system_specs();
 }
@@ -1439,6 +1446,93 @@ void retro_unload_game(void)
 // MDFN_MidSync below for the full rationale.
 static bool current_frame_is_sim = false;
 
+/* RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER: a buffer of the
+ * frontend's own that this frame renders into instead of surf, so under
+ * threaded video the frame is presented without a full-frame copy.
+ *
+ * The pointer, width, height and pitch the frontend lends go back to
+ * video_cb exactly as lent - libretro leaves anything else undefined,
+ * and released frontends do break on an offset pointer or another
+ * size. So the loan is asked for at the geometry the frontend will
+ * show, which is last frame's output size, and lent_surf is that
+ * window of the scanout: row 0 is scanout line linevisfirst, a row is
+ * game_width pixels. The renderer clips to the window
+ * (MDFN_Surface_Line, surface->w); a frame that comes out at another
+ * geometry is duped rather than pushed at a size the loan was not
+ * asked for, and the next frame's loan has the new size.
+ *
+ * An interlaced picture is lent when every row of the output comes
+ * from this frame's field: Off and Progressive (the renderer writes
+ * both rows of a pair), Bob (the field alone, folded into the loan's
+ * consecutive rows by the surface, so the deinterlacer copies nothing)
+ * and Bob (Offset) (the deinterlacer fills the other rows from this
+ * field, in the loan). Weave and FastMAD show the previous frame's
+ * field as well, which only the core's own surface keeps, so those
+ * render into surf as before. A loan is made for the interlace state
+ * the previous frame settled on; a frame that switches is duped.
+ *
+ * Declined, and the frame renders into surf, when the frontend has no
+ * buffer to lend or offers another format or an unusable pitch; for a
+ * run-ahead simulation frame nobody will see; and with a horizontal
+ * overscan mask, which would start the window inside a row. */
+static MDFN_Surface lent_surf;
+static bool         last_frame_interlaced;
+/* The previous frame's interlace state went through the deinterlacer
+ * (or was progressive): PrevInterlaced describes its output. */
+static bool         last_frame_settled;
+static bool         lent_interlaced;
+static size_t       lent_pitch;
+
+static bool interlace_lendable(void)
+{
+#ifdef NEED_DEINTERLACER
+   const unsigned dt = Deinterlacer_GetType(&deint);
+   return dt == DEINT_OFF || dt == DEINT_BOB || dt == DEINT_BOB_OFFSET;
+#else
+   return false;
+#endif
+}
+
+static MDFN_Surface *acquire_lent_surface(unsigned linevisfirst)
+{
+   struct retro_framebuffer fb;
+
+   /* A frame that misses its loan's geometry is duped. */
+   if (!surf || !environ_cb || !libretro_can_dupe || current_frame_is_sim)
+      return NULL;
+   if (last_frame_interlaced && (!last_frame_settled || !interlace_lendable()))
+      return NULL;
+   if (h_mask || !game_width || !game_height)
+      return NULL;
+
+   memset(&fb, 0, sizeof(fb));
+   fb.width        = game_width;
+   fb.height       = game_height;
+   /* Read as well as write: the renderer's line mirror and blend
+    * read back what it scanned out this frame. */
+   fb.access_flags = RETRO_MEMORY_ACCESS_WRITE | RETRO_MEMORY_ACCESS_READ;
+
+   if (   !environ_cb(RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER, &fb)
+       || !fb.data
+       || fb.format != RETRO_PIXEL_FORMAT_XRGB8888
+       || (fb.pitch & (sizeof(uint32_t) - 1))
+       || fb.pitch < (size_t)game_width * sizeof(uint32_t)
+       || fb.pitch > (size_t)1 << 20
+       || !(fb.memory_flags & RETRO_MEMORY_TYPE_CACHED))
+      return NULL;
+
+   lent_surf.pixels     = (uint32_t*)fb.data;
+   lent_surf.w          = (int32_t)game_width;
+   lent_surf.h          = (int32_t)game_height;
+   lent_surf.pitchinpix = (int32_t)(fb.pitch / sizeof(uint32_t));
+   lent_surf.y0         = (int32_t)(linevisfirst << PrevInterlaced);
+   /* Bob: one field at half height */
+   lent_surf.fold       = (last_frame_interlaced && !PrevInterlaced) ? 1 : 0;
+   lent_interlaced      = last_frame_interlaced;
+   lent_pitch           = fb.pitch;
+   return &lent_surf;
+}
+
 void retro_run(void)
 {
    bool updated = false;
@@ -1495,7 +1589,12 @@ void retro_run(void)
     * semantics: surface/LineWidths NULL, InterlaceOn/Field/skip
     * false, sizes/cycles 0. */
    EmulateSpecStruct spec = {0};
-   spec.surface = surf;
+   /* The frontend's buffer when it lends one, else the core's own. */
+   MDFN_Surface *frame_surf = acquire_lent_surface(linevisfirst);
+   const bool lent          = (frame_surf != NULL);
+   if (!lent)
+      frame_surf = surf;
+   spec.surface = frame_surf;
    spec.LineWidths = rects;
    spec.SoundBufSize = 0;
 
@@ -1505,8 +1604,20 @@ void retro_run(void)
    Emulate(espec);
    link_sci_frame_end();
 
+   /* Before the deinterlacer clears it: next frame's lend decision. */
+   last_frame_interlaced = spec.InterlaceOn;
+   /* The loan was made for this interlace state, and for a folded or
+    * full-height picture as the deinterlacer now produces it. */
+   last_frame_settled    = !lent || lent_interlaced == spec.InterlaceOn;
 #ifdef NEED_DEINTERLACER
-   if (spec.InterlaceOn)
+   if (lent && spec.InterlaceOn)
+      last_frame_settled = last_frame_settled
+         && (frame_surf->fold != 0) == (Deinterlacer_GetType(&deint) == DEINT_BOB);
+
+   /* A loan not made for this frame's shape holds a field misplaced:
+    * the frame is duped below, and the next one renders into surf
+    * with the deinterlacer started fresh. */
+   if (spec.InterlaceOn && last_frame_settled)
    {
       if (!PrevInterlaced)
          Deinterlacer_ClearState(&deint);
@@ -1566,11 +1677,23 @@ void retro_run(void)
       input_set_geometry(cur_width, cur_height);
    }
 
-   pix += surf->pitchinpix * (linevisfirst << PrevInterlaced) + overscan_mask;
-
-   fb = pix;
-
-   video_cb(fb, game_width, game_height, pitch);
+   if (lent)
+   {
+      /* Back as lent, or not at all: a frame at another geometry than
+       * the loan's is a dupe. */
+      pitch = lent_pitch;
+      if (     last_frame_settled
+            && cur_width  == (unsigned)frame_surf->w
+            && cur_height == (unsigned)frame_surf->h)
+         fb = frame_surf->pixels;
+      video_cb(fb, (unsigned)frame_surf->w, (unsigned)frame_surf->h, pitch);
+   }
+   else
+   {
+      pix += surf->pitchinpix * (linevisfirst << PrevInterlaced) + overscan_mask;
+      fb   = pix;
+      video_cb(fb, game_width, game_height, pitch);
+   }
    audio_batch_cb((int16_t*)&IBuffer, spec.SoundBufSize);
 
    //
@@ -1758,6 +1881,9 @@ void retro_deinit(void)
 #endif
 
    libretro_supports_bitmasks          = false;
+   libretro_can_dupe                   = false;
+   last_frame_interlaced               = false;
+   last_frame_settled                  = false;
 }
 
 unsigned retro_get_region(void)
@@ -1859,6 +1985,9 @@ size_t retro_serialize_size(void)
       st.malloced       = 0;
       st.initial_malloc = 0;
 
+      /* Sized for the largest state, so a feature switched on later
+       * still fits; smaller states are padded (see retro_serialize). */
+      MDFNSS_SizingPass = true;
       if (MDFNSS_SaveSM(&st, MEDNAFEN_CORE_VERSION_NUMERIC))
       {
          // Cache and tidy up.
@@ -1866,6 +1995,7 @@ size_t retro_serialize_size(void)
          if (st.data)
             free(st.data);
       }
+      MDFNSS_SizingPass = false;
    }
 
    // Return cached value.
@@ -1888,17 +2018,15 @@ bool retro_serialize(void *data, size_t size)
     * the save if the passed-in size is too small */
    ret               = MDFNSS_SaveSM(&st, MEDNAFEN_CORE_VERSION_NUMERIC);
 
-   if (st.len != size)
+   if (st.data != st.data_frontend)
    {
       log_cb(RETRO_LOG_WARN, "Save state size has changed.\n");
-
-      if (st.data != st.data_frontend)
-      {
-         free(st.data);
-         serialize_size = st.len;
-         ret            = false;
-      }
+      free(st.data);
+      serialize_size = st.len;
+      ret            = false;
    }
+   else if (st.len < size)
+      memset((uint8_t*)data + st.len, 0, size - st.len);
 
    return ret;
 }

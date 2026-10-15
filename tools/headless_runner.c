@@ -20,6 +20,27 @@
 **   RUNNER_HASH_SECTIONS=1  also hash each savestate section by name, to
 **                           see which subsystem diverged first.
 **   RUNNER_DUMP=file.ppm    write every frame to file.ppm (last one wins).
+**   RUNNER_FRAME_HASH=1     print an FNV-1a hash of every pushed frame's
+**                           pixels (a dupe prints "dupe"), to compare the
+**                           picture between configurations.
+**   RUNNER_LEND=N           answer GET_CURRENT_SOFTWARE_FRAMEBUFFER on
+**                           every Nth frame with a buffer the exact size
+**                           asked for, inside canary bands, and check
+**                           that the push returns the buffer exactly as
+**                           lent (pointer, width, height, pitch) and that
+**                           nothing was written outside it. 1 lends
+**                           every frame. RUNNER_LEND_PAD=P pads the pitch
+**                           by P bytes. A violation is fatal.
+**   RUNNER_SET_AT=N:k=v     change core option k to v before frame N (one
+**                           change; a geometry change on a lent frame is
+**                           the mismatch case).
+**   RUNNER_FRAMETIME=1      report retro_run's wall time per frame:
+**                           median, p99, p99.9, max and the frames over
+**                           half a 60 Hz frame (8.3 ms).
+**   RUNNER_WAV=file.wav     write the core's audio to a 16-bit stereo WAV
+**                           at the rate the core reports.
+**   RUNNER_PRESS=N:B        hold joypad button B (RETRO_DEVICE_ID_JOYPAD_*
+**                           number) on port 0 for frames N..N+9.
 **   RUNNER_VERBOSE=1        pass the core's info-level log through.
 **
 ** Profiling: perf record -F 499 -D 40000 -- ./runner ... 7200 skips the
@@ -55,8 +76,59 @@ static void now_mono(struct timespec* ts)
 
 static const char* sysdir = "/home/claude/sys";   /* BIOS directory; override with RUNNER_SYSDIR */
 static struct { const char* k; const char* v; } vars[32]; static int nvars;
+static int  vars_updated;
+static long set_at_frame = -1; static char* set_at_k; static char* set_at_v;
 static retro_log_printf_t logcb;
 static int quiet = 1;
+
+/* RUNNER_LEND: the frame buffer lent this frame, with canary bands on
+ * both sides. The push must hand it back untouched outside the window. */
+#define LEND_CANARY 4096
+static int      lend_every, lend_pad;
+static uint8_t* lend_block;      /* canary + buffer + canary */
+static size_t   lend_block_cap;
+static void*    lend_data;       /* what was lent, NULL when nothing was */
+static unsigned lend_w, lend_h;
+static size_t   lend_pitch;
+static unsigned long frames_run, lend_asked, lend_zero_copy, lend_dupes;
+
+static bool lend_framebuffer(struct retro_framebuffer* fb)
+{
+ size_t pitch, need, i;
+ if(!lend_every || (frames_run % lend_every)) return false;
+ if(!fb->width || !fb->height) return false;
+ pitch = (size_t)fb->width * 4 + lend_pad;
+ need  = pitch * fb->height + 2 * LEND_CANARY;
+ if(need > lend_block_cap) { lend_block = realloc(lend_block, need); lend_block_cap = need; }
+ for(i = 0; i < need; i++) lend_block[i] = (uint8_t)(0xA5 ^ i);
+ lend_data  = lend_block + LEND_CANARY;
+ lend_w     = fb->width;
+ lend_h     = fb->height;
+ lend_pitch = pitch;
+ fb->data         = lend_data;
+ fb->pitch        = pitch;
+ fb->format       = RETRO_PIXEL_FORMAT_XRGB8888;
+ fb->memory_flags = RETRO_MEMORY_TYPE_CACHED;
+ lend_asked++;
+ return true;
+}
+
+/* The canaries, and the pitch padding of every row, must still carry the
+ * pattern they were lent with. */
+static void lend_check_bounds(void)
+{
+ size_t i, y, base = lend_pitch * lend_h + LEND_CANARY;
+ for(i = 0; i < LEND_CANARY; i++)
+  if(lend_block[i] != (uint8_t)(0xA5 ^ i) || lend_block[base + i] != (uint8_t)(0xA5 ^ (base + i)))
+  { fprintf(stderr, "frame %lu: write outside the lent buffer (%s canary)\n", frames_run, i < LEND_CANARY && lend_block[i] != (uint8_t)(0xA5 ^ i) ? "front" : "back"); exit(3); }
+ for(y = 0; y < lend_h; y++)
+  for(i = (size_t)lend_w * 4; i < lend_pitch; i++)
+  {
+   size_t k = LEND_CANARY + y * lend_pitch + i;
+   if(lend_block[k] != (uint8_t)(0xA5 ^ k))
+   { fprintf(stderr, "frame %lu: write into the pitch padding of row %lu\n", frames_run, (unsigned long)y); exit(3); }
+  }
+}
 
 static void log_printf(enum retro_log_level lvl, const char* fmt, ...)
 {
@@ -83,7 +155,8 @@ static bool env_cb(unsigned cmd, void* data)
    return false;
   }
   case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
-   *(bool*)data = false; return true;
+   *(bool*)data = vars_updated != 0; vars_updated = 0;
+   return true;
   case RETRO_ENVIRONMENT_GET_CAN_DUPE:
    *(bool*)data = true; return true;
   case RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION:
@@ -111,14 +184,42 @@ static bool env_cb(unsigned cmd, void* data)
    return true;
   case RETRO_ENVIRONMENT_GET_INPUT_BITMASKS:
    return true;
+  case RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER:
+   return lend_framebuffer((struct retro_framebuffer*)data);
   default:
    return false;
  }
 }
 
 static const char* dump_path;
+static int frame_hash;
 static void video_cb(const void* d, unsigned w, unsigned h, size_t p)
 {
+ if(lend_data)
+ {
+  /* A lent buffer comes back exactly as lent, or as a dupe. */
+  if(d)
+  {
+   if(d != lend_data || w != lend_w || h != lend_h || p != lend_pitch)
+   { fprintf(stderr, "frame %lu: lent %p %ux%u pitch %lu, pushed %p %ux%u pitch %lu\n", frames_run, lend_data, lend_w, lend_h, (unsigned long)lend_pitch, d, w, h, (unsigned long)p); exit(3); }
+   lend_zero_copy++;
+  }
+  else
+   lend_dupes++;
+  lend_check_bounds();
+  lend_data = NULL;
+ }
+ if(frame_hash)
+ {
+  if(!d) printf("frame %6lu dupe\n", frames_run);
+  else
+  {
+   uint64_t fh = 1469598103934665603ull; unsigned y, x;
+   for(y = 0; y < h; y++) { const uint32_t* row = (const uint32_t*)((const char*)d + y * p);
+    for(x = 0; x < w; x++) { fh ^= row[x] & 0xFFFFFF; fh *= 1099511628211ull; } }
+   printf("frame %6lu %ux%u %016llx\n", frames_run, w, h, (unsigned long long)fh);
+  }
+ }
  if(!dump_path || !d) return;
  FILE* f = fopen(dump_path, "wb"); unsigned y, x;
  if(!f) return;
@@ -127,10 +228,33 @@ static void video_cb(const void* d, unsigned w, unsigned h, size_t p)
   for(x = 0; x < w; x++) { unsigned char rgb[3] = { row[x] >> 16, row[x] >> 8, row[x] }; fwrite(rgb, 1, 3, f); } }
  fclose(f);
 }
-static size_t audio_batch_cb(const int16_t* d, size_t f) { (void)d; return f; }
+static FILE* wav_f; static unsigned long wav_frames;
+static size_t audio_batch_cb(const int16_t* d, size_t f)
+{
+ if(wav_f && f) { fwrite(d, 4, f, wav_f); wav_frames += f; }
+ return f;
+}
+static void wav_header(FILE* f, unsigned rate, unsigned long frames)
+{
+ unsigned char h[44]; unsigned long data = frames * 4;
+ memcpy(h, "RIFF", 4); h[4]=(unsigned char)(data+36); h[5]=(unsigned char)((data+36)>>8); h[6]=(unsigned char)((data+36)>>16); h[7]=(unsigned char)((data+36)>>24);
+ memcpy(h+8, "WAVEfmt ", 8); h[16]=16; h[17]=h[18]=h[19]=0; h[20]=1; h[21]=0; h[22]=2; h[23]=0;
+ h[24]=(unsigned char)rate; h[25]=(unsigned char)(rate>>8); h[26]=(unsigned char)(rate>>16); h[27]=(unsigned char)(rate>>24);
+ h[28]=(unsigned char)(rate*4); h[29]=(unsigned char)((rate*4)>>8); h[30]=(unsigned char)((rate*4)>>16); h[31]=(unsigned char)((rate*4)>>24);
+ h[32]=4; h[33]=0; h[34]=16; h[35]=0; memcpy(h+36, "data", 4);
+ h[40]=(unsigned char)data; h[41]=(unsigned char)(data>>8); h[42]=(unsigned char)(data>>16); h[43]=(unsigned char)(data>>24);
+ fseek(f, 0, SEEK_SET); fwrite(h, 1, 44, f);
+}
 static void audio_cb(int16_t l, int16_t r) { (void)l;(void)r; }
 static void input_poll_cb(void) {}
-static int16_t input_state_cb(unsigned port, unsigned dev, unsigned idx, unsigned id) { (void)port;(void)dev;(void)idx;(void)id; return 0; }
+static long press_frame = -1; static unsigned press_id;
+static int16_t input_state_cb(unsigned port, unsigned dev, unsigned idx, unsigned id)
+{
+ (void)dev;(void)idx;
+ if(port || press_frame < 0 || (long)frames_run < press_frame || (long)frames_run >= press_frame + 10) return 0;
+ if(id == RETRO_DEVICE_ID_JOYPAD_MASK) return (int16_t)(1 << press_id);
+ return id == press_id;
+}
 
 #define SYM(name) name##_t p_##name = (name##_t)dlsym(h, #name); if(!p_##name) { fprintf(stderr, "missing %s\n", #name); return 1; }
 typedef void (*retro_set_environment_t)(retro_environment_t);
@@ -189,6 +313,15 @@ int main(int argc, char** argv)
  if(!getenv("RUNNER_SYSDIR")) sysdir = "Z:\\home\\claude\\sys";
 #endif
  dump_path = getenv("RUNNER_DUMP");
+ frame_hash = getenv("RUNNER_FRAME_HASH") != NULL;
+ lend_every = getenv("RUNNER_LEND") ? atoi(getenv("RUNNER_LEND")) : 0;
+ lend_pad   = getenv("RUNNER_LEND_PAD") ? atoi(getenv("RUNNER_LEND_PAD")) : 0;
+ if(getenv("RUNNER_PRESS")) { press_frame = atol(getenv("RUNNER_PRESS")); press_id = (unsigned)atoi(strchr(getenv("RUNNER_PRESS"), ':') ? strchr(getenv("RUNNER_PRESS"), ':') + 1 : "3"); }
+ if(getenv("RUNNER_SET_AT"))
+ {
+  char* spec = strdup(getenv("RUNNER_SET_AT")); char* colon = strchr(spec, ':'); char* eq = colon ? strchr(colon, '=') : NULL;
+  if(colon && eq) { *colon = 0; *eq = 0; set_at_frame = atol(spec); set_at_k = colon + 1; set_at_v = eq + 1; }
+ }
  h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
  if(!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
  SYM(retro_set_environment) SYM(retro_set_video_refresh) SYM(retro_set_audio_sample) SYM(retro_set_audio_sample_batch)
@@ -204,24 +337,53 @@ int main(int argc, char** argv)
  memset(&gi, 0, sizeof gi); gi.path = argv[2];
  if(!p_retro_load_game(&gi)) { fprintf(stderr, "load_game failed\n"); return 2; }
  p_retro_get_system_av_info(&av);
+ if(getenv("RUNNER_WAV") && (wav_f = fopen(getenv("RUNNER_WAV"), "wb")))
+  wav_header(wav_f, (unsigned)(av.timing.sample_rate + 0.5), 0);
  frames = atoi(argv[3]);
  now_mono(&t0);
  {
   const char* he = getenv("RUNNER_HASH_EVERY"); int every = he ? atoi(he) : 0;
   void* sbuf = NULL; size_t scap = 0;
+  int ftime = getenv("RUNNER_FRAMETIME") != NULL;
+  double* ft = ftime ? (double*)malloc(sizeof(double) * (frames > 0 ? frames : 1)) : NULL;
   for(i = 0; i < frames; i++)
   {
+   if(i == set_at_frame)
+   {
+    int k, found = 0;
+    for(k = 0; k < nvars; k++) if(!strcmp(vars[k].k, set_at_k)) { vars[k].v = set_at_v; found = 1; }
+    if(!found && nvars < 32) { vars[nvars].k = set_at_k; vars[nvars].v = set_at_v; nvars++; }
+    vars_updated = 1;
+   }
+   if(ft) { struct timespec a, b; now_mono(&a); p_retro_run(); now_mono(&b); ft[i] = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6; }
+   else
    p_retro_run();
+   frames_run++;
+   if(lend_data) { fprintf(stderr, "frame %lu: lent buffer never pushed\n", frames_run); return 3; }
    if(every && ((i + 1) % every) == 0)
     printf("frame %6d state %016llx\n", i + 1, (unsigned long long)hash_state(p_retro_serialize_size, p_retro_serialize, &sbuf, &scap));
   }
   free(sbuf);
+  if(ft && frames > 0)
+  {
+   /* Insertion sort is plenty for a few thousand frames. */
+   int j, k, over = 0;
+   for(j = 0; j < frames; j++) if(ft[j] > 8.33) over++;
+   for(j = 1; j < frames; j++) { double v = ft[j]; k = j - 1; while(k >= 0 && ft[k] > v) { ft[k + 1] = ft[k]; k--; } ft[k + 1] = v; }
+   fprintf(stderr, "retro_run ms: median %.3f p99 %.3f p99.9 %.3f max %.3f over_8.3ms %d\n",
+     ft[frames / 2], ft[(int)(frames * 0.99)], ft[(int)(frames * 0.999)], ft[frames - 1], over);
+   free(ft);
+  }
  }
  now_mono(&t1);
  {
   double s = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
   fprintf(stderr, "%d frames in %.2f s = %.1f fps (%.2fx realtime at %.2f fps)\n", frames, s, frames / s, (frames / s) / av.timing.fps, av.timing.fps);
+  if(lend_every)
+   fprintf(stderr, "lent %lu: %lu pushed zero-copy, %lu duped\n", lend_asked, lend_zero_copy, lend_dupes);
  }
+ if(wav_f) { wav_header(wav_f, (unsigned)(av.timing.sample_rate + 0.5), wav_frames); fclose(wav_f); }
  p_retro_unload_game(); p_retro_deinit(); dlclose(h);
+ free(lend_block);
  return 0;
 }
