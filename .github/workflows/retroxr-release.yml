@@ -5,7 +5,7 @@
 # the SH-2's serial port at all -- its six registers read zero and every write
 # was dropped -- so a cable had nothing to plug into. mednafen/ss/sh7095_sci.inc
 # implements the SCI (async and clocked, the four interrupts, and the DMAC's
-# RXI/TXI request sources), and link_sci.c speaks `saturn-sci-1` over a link bus
+# RXI/TXI request sources), and link_sci.c speaks `saturn-sci` over a link bus
 # the frontend hosts (libretro/RetroArch#19454).
 #
 # beetle_saturn_link_cable is on by default and is not restart-time; 'disabled'

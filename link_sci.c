@@ -39,7 +39,7 @@ extern retro_log_printf_t log_cb;
 
 /* Peers whose protocol ids differ are never joined, which keeps this cable out
  * of every other machine's socket. */
-#define SL_PROTOCOL "saturn-sci-1"
+#define SL_PROTOCOL "saturn-sci"
 
 /* A link cable has two ends. The bus would join a third console; refusing it
  * here is cheaper than deciding what a three-way crossover means. */
