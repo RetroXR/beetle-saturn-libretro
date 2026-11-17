@@ -123,12 +123,14 @@ SOURCES_C += $(CDROM_DIR)/CDAccess_CHD.c \
              $(LIBRETRO_COMM_DIR)/formats/7z/r7z_lzma.c \
              $(LIBRETRO_COMM_DIR)/formats/flac/rflac.c \
              $(LIBRETRO_COMM_DIR)/encodings/encoding_huffman.c \
-             $(LIBRETRO_COMM_DIR)/encodings/encoding_rzstd.c
+             $(LIBRETRO_COMM_DIR)/encodings/encoding_rzstd.c \
+             $(LIBRETRO_COMM_DIR)/encodings/encoding_xxh64.c
 endif
 
 SOURCES_C += $(MEDNAFEN_DIR)/state.c
 
 SOURCES_C += $(MEDNAFEN_DIR)/cdstream.c \
+		$(MEDNAFEN_DIR)/save_writer.c \
 		$(MEDNAFEN_DIR)/general.c \
 		$(MEDNAFEN_DIR)/mempatcher.c \
 		$(MEDNAFEN_DIR)/settings.c \
@@ -169,7 +171,8 @@ ifeq ($(NEED_THREADING), 1)
 SOURCES_C +=	 $(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
                  $(LIBRETRO_COMM_DIR)/queues/retro_spsc.c \
                  $(CORE_DIR)/mednafen/thread_queue.c \
-                 $(CORE_DIR)/mednafen/thread_eventcount.c
+                 $(CORE_DIR)/mednafen/thread_eventcount.c \
+                 $(CORE_DIR)/mednafen/thread_eventcount_common.c
 endif
 
 # Dynamically loaded builds only: statically linked frontends share one

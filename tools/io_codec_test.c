@@ -10,16 +10,37 @@
 static void test_log(enum retro_log_level level, const char *fmt, ...)
 { (void)level; (void)fmt; }
 static bool short_reads;
+/* One-shot seek failure that leaves the handle at EOF, as a frontend
+ * VFS may do when it fails partway through repositioning. */
+static bool fail_next_seek;
 static struct retro_vfs_file_handle *vopen(const char *p, unsigned mode, unsigned hints)
 { (void)mode; (void)hints; return (struct retro_vfs_file_handle*)fopen(p, "rb"); }
 static int vclose(struct retro_vfs_file_handle *h) { return fclose((FILE*)h); }
 static int64_t vtell(struct retro_vfs_file_handle *h) { return _ftelli64((FILE*)h); }
 static int64_t vseek(struct retro_vfs_file_handle *h, int64_t off, int whence)
-{ return _fseeki64((FILE*)h, off, whence) ? -1 : vtell(h); }
+{
+   if (fail_next_seek)
+   {
+      fail_next_seek = false;
+      _fseeki64((FILE*)h, 0, SEEK_END);
+      return -1;
+   }
+   return _fseeki64((FILE*)h, off, whence) ? -1 : 0;
+}
+static bool sector_ok(CDAccess *cd, uint8_t *buf, unsigned frame)
+{
+   unsigned j;
+   if (!cd->Read_Raw_Sector(cd, buf, frame)) return false;
+   for (j = 0; j < 2352; j++)
+      if (buf[j] != (uint8_t)(frame * 17 + (j ^ 1) * 13)) return false;
+   return true;
+}
 static int64_t vsize(struct retro_vfs_file_handle *h)
 {
-   int64_t p = vtell(h), n = vseek(h, 0, SEEK_END);
-   vseek(h, p, SEEK_SET); return n;
+   int64_t p = vtell(h), n;
+   if (p < 0 || vseek(h, 0, SEEK_END) < 0) return -1;
+   n = vtell(h);
+   return vseek(h, p, SEEK_SET) < 0 ? -1 : n;
 }
 static int64_t vread(struct retro_vfs_file_handle *h, void *p, uint64_t n)
 { if (short_reads && n > 7) n = 7; return fread(p, 1, (size_t)n, (FILE*)h); }
@@ -62,6 +83,18 @@ int main(int argc, char **argv)
       ch = (CDAccess_CHD*)cd;
       if (mode && ch->mapped) return 3;
       if (mode == 2 && !ch->precache) return 4;
+      if (mode == 1)
+      {
+         /* Hunk 0 leaves the stream where hunk 1's data starts. A failed
+          * seek for hunk 2 moves the handle, so hunk 1 must re-seek
+          * rather than trust the position it last recorded. */
+         if (!sector_ok(cd, buf, 0)) return 17;
+         fail_next_seek = true;
+         if (cd->Read_Raw_Sector(cd, buf, 16)) return 18;
+         if (fail_next_seek) return 19;
+         if (!sector_ok(cd, buf, 8))
+         { printf("stale position after failed seek: %s\n", argv[1]); return 20; }
+      }
       for (i = 0; i < 96; i++)
       {
          unsigned frame = (i * 17) % 32, j;
