@@ -1347,12 +1347,10 @@ bool retro_load_game(const struct retro_game_info *info)
 
    /* The Link Cable. Attached whether or not anything is ever cabled: an
     * unjoined port bounds nobody, so the core has one code path and still
-    * runs alone. The experimental number first, then the one upstream may
-    * settle on. */
+    * runs alone. */
    {
       static struct retro_link_interface link;
-      if (environ_cb(RETRO_ENVIRONMENT_GET_LINK_INTERFACE, &link) ||
-          environ_cb(RETRO_ENVIRONMENT_GET_LINK_INTERFACE_FINAL, &link))
+      if (environ_cb(RETRO_ENVIRONMENT_GET_LINK_INTERFACE, &link))
          link_sci_attach(&link, 0);
    }
 
